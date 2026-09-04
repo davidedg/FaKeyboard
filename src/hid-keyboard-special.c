@@ -282,8 +282,18 @@ const byte corsair_report[29] =
 char buffer[BSIZE + 1];
 int  bsize = 0;
 int  seqnum81 = 0;
+int  devid81 = 0;
 int  seqnum82 = 0;
 int  seqnum03 = 0;
+
+// Set once a "key <idx>" control-fifo line has sent a keydown report; the next EP 0x81 poll
+// auto-completes it with an all-zero (keyup) report - see k68_handle_ctrl_line() below for why
+// this can't just be sent back-to-back with the keydown from within the same call.
+int pending_release = 0;
+
+// N_KEYBYTES_HW (src/daemon/keymap.h in ckb-next) - size of the flat keymap[] bitmap that
+// corsair_kbcopy() memcpy()s straight into kb->input.keys[]. Keep in sync if that ever changes.
+#define KEY_BITMAP_BYTES 19
 
 void handle_data(int sockfd, USBIP_RET_SUBMIT* usb_req, int bl)
 {
@@ -327,11 +337,46 @@ void handle_data(int sockfd, USBIP_RET_SUBMIT* usb_req, int bl)
     else if(usb_req->ep == 0x01)
     {
         seqnum81 = usb_req->seqnum;
+        devid81 = usb_req->devid;
+        if(pending_release)
+        {
+            char release_report[BSIZE] = { 0x03 }; // CORSAIR_IN, rest (19-byte bitmap + pad) zero
+            send_async_response(sockfd, devid81, seqnum81, 0x81, release_report, BSIZE);
+            pending_release = 0;
+        }
     }
     //else if(usb_req->ep == 0x02)
     //{
     //    seqnum82 = usb_req->seqnum;
     //}
+};
+
+// Handles lines written to the control FIFO (see usbip_run()/ctrl_line_handler in usbip.c) to
+// simulate a physical keypress. "key <idx>" (idx = bit position, 0-151, in ckb-next's internal
+// keymap[] array) sends a Corsair software-mode keydown report (0x03 + 19-byte bitmap with bit
+// idx set) completing the currently-stashed EP 0x81 URB, then arms pending_release so the very
+// next EP 0x81 poll (the kernel resubmits immediately after each completion, ~1ms interval) sends
+// the matching keyup (all-zero bitmap) automatically - corsair_kbcopy() on the daemon side does a
+// flat memcpy of the whole bitmap, not a delta, so an unreleased key would stay "held" forever.
+void k68_handle_ctrl_line(int sockfd, const char* line)
+{
+    int idx;
+    if(sscanf(line, "key %d", &idx) == 1 && idx >= 0 && idx < KEY_BITMAP_BYTES * 8)
+    {
+        if(seqnum81 == 0)
+        {
+            printf("ctrl: no EP 0x81 poll seen yet, device may not be attached/active\n");
+            return;
+        }
+        char press_report[BSIZE] = { 0x03 }; // CORSAIR_IN
+        press_report[1 + idx / 8] |= (char)(1 << (idx % 8));
+        send_async_response(sockfd, devid81, seqnum81, 0x81, press_report, BSIZE);
+        pending_release = 1;
+    }
+    else
+    {
+        printf("ctrl: unrecognized line '%s'\n", line);
+    }
 };
 
 void handle_unknown_control(int sockfd, StandardDeviceRequest* control_req, USBIP_RET_SUBMIT* usb_req)
@@ -381,6 +426,7 @@ void handle_unknown_control(int sockfd, StandardDeviceRequest* control_req, USBI
 int main(int argc, char* argv[])
 {
     printf("hid special keyboard started....\n");
+    ctrl_line_handler = k68_handle_ctrl_line;
     usbip_run(&dev_dsc);
 }
 
