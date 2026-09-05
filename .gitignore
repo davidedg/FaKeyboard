@@ -3,3 +3,6 @@
 .*
 *.o
 !*.*
+/src/hid-*
+!/src/hid-*.*
+/src/*.o

@@ -27,8 +27,11 @@
 #include<sys/types.h>
 #include<sys/socket.h>
 #include<sys/un.h>
+#include<sys/stat.h>
 #include<netinet/in.h>
 #include<arpa/inet.h>
+#include<poll.h>
+#include<fcntl.h>
 #define        min(a,b)        ((a) < (b) ? (a) : (b))
 #else
 #include<winsock.h>
@@ -627,7 +630,16 @@ void send_corsair_req_in(int sockfd, USBIP_RET_SUBMIT* usb_req, char* data, unsi
 void send_corsair_response(int sockfd, USBIP_RET_SUBMIT* usb_req, char* data, unsigned int size, unsigned int status, int ep);
 void send_ctrl_response(int sockfd, USBIP_RET_SUBMIT* usb_req, char* data, unsigned int size, unsigned int status);
 void send_ctrl_response_response(int sockfd, USBIP_RET_SUBMIT* usb_req, char* data, unsigned int size, unsigned int status);
+// Completes a previously-stashed URB (devid/seqnum captured earlier, e.g. from a stored poll on
+// an interrupt IN endpoint) with a single send() of header+payload. For unsolicited/asynchronous
+// completions where the caller has no "live" USBIP_RET_SUBMIT for the current request.
+void send_async_response(int sockfd, int devid, int seqnum, int ep, char* data, unsigned int size);
 void usbip_run (const USB_DEVICE_DESCRIPTOR* dev_dsc);
+
+// Optional: set by a hid-*.c program before calling usbip_run() to receive lines written to the
+// control FIFO named by the FAKEYBOARD_CTRL_FIFO env var. NULL (default) disables the control
+// channel entirely - no FIFO is created and behavior is unchanged from before this existed.
+extern void (*ctrl_line_handler)(int sockfd, const char* line);
 
 //implemented by user
 extern const USB_DEVICE_DESCRIPTOR dev_dsc;

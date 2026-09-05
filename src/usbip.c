@@ -29,6 +29,8 @@
 
 #include "usbip.h"
 
+void (*ctrl_line_handler)(int sockfd, const char* line) = NULL;
+
 //#define _DEBUG
 
 //#ifdef _DEBUG
@@ -251,6 +253,38 @@ void send_usb_req(int sockfd, USBIP_RET_SUBMIT* usb_req, char* data, unsigned in
 #ifdef _DEBUG
     print_recv((char*)usb_req, sizeof(USBIP_RET_SUBMIT), "SendString");
 #endif
+
+    if((size_t)send(sockfd, merged, sizeof(USBIP_RET_SUBMIT) + size, 0) != sizeof(USBIP_RET_SUBMIT) + size)
+    {
+        printf("send error : %s \n", strerror (errno));
+        free(merged);
+        exit(-1);
+    }
+    free(merged);
+}
+
+// Completes a stashed URB (devid/seqnum captured earlier) with a single send() of header+payload,
+// unlike send_corsair_response()'s two separate send() calls - minimizes any interleaving window
+// since this is meant for use as an unsolicited/asynchronous completion.
+void send_async_response(int sockfd, int devid, int seqnum, int ep, char* data, unsigned int size)
+{
+    USBIP_RET_SUBMIT usb_req;
+    usb_req.command = 0x3;
+    usb_req.seqnum = seqnum;
+    usb_req.devid = devid;
+    usb_req.direction = 0x1; // IN
+    usb_req.ep = ep;
+    usb_req.status = 0;
+    usb_req.actual_length = size;
+    usb_req.start_frame = 0x0;
+    usb_req.number_of_packets = 0x0;
+    usb_req.error_count = 0;
+    usb_req.setup = 0x0;
+
+    pack((int*)&usb_req, sizeof(USBIP_RET_SUBMIT));
+    char* merged = malloc(sizeof(USBIP_RET_SUBMIT) + size);
+    memcpy(merged, &usb_req, sizeof(USBIP_RET_SUBMIT));
+    memcpy(merged + sizeof(USBIP_RET_SUBMIT), data, size);
 
     if((size_t)send(sockfd, merged, sizeof(USBIP_RET_SUBMIT) + size, 0) != sizeof(USBIP_RET_SUBMIT) + size)
     {
@@ -526,10 +560,16 @@ usbip_run (const USB_DEVICE_DESCRIPTOR* dev_dsc)                                
     if (setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, (const char*)&reuse, sizeof(reuse)) < 0)
         perror("setsockopt(SO_REUSEADDR) failed");
 
+    int tcp_port = TCP_SERV_PORT;
+    const char* port_env = getenv("FAKEYBOARD_PORT");
+    if (port_env)
+        tcp_port = atoi(port_env);
+    printf("Listening on TCP port %d\n", tcp_port);
+
     memset (&serv, 0, sizeof (serv));
     serv.sin_family = AF_INET;
     serv.sin_addr.s_addr = htonl (INADDR_ANY);
-    serv.sin_port = htons (TCP_SERV_PORT);
+    serv.sin_port = htons (tcp_port);
 
     if (bind (listenfd, (sockaddr*) & serv, sizeof (serv)) < 0)
     {
@@ -542,6 +582,32 @@ usbip_run (const USB_DEVICE_DESCRIPTOR* dev_dsc)                                
         printf ("listen error : %s \n", strerror (errno));
         exit (1);
     };
+
+    // Optional control FIFO: only set up if a hid-*.c program registered a handler. Opened
+    // O_RDWR (not O_RDONLY) so the process holds its own writer reference - this avoids ever
+    // seeing EOF (all-writers-closed) on the read side, which would otherwise make poll() spin
+    // reporting POLLIN forever whenever no external writer is currently connected.
+    int ctrlfd = -1;
+    char ctrlbuf[256];
+    int ctrlbuf_len = 0;
+    if (ctrl_line_handler)
+    {
+        const char* ctrl_path = getenv("FAKEYBOARD_CTRL_FIFO");
+        if (ctrl_path)
+        {
+            unlink(ctrl_path);
+            if (mkfifo(ctrl_path, 0600) < 0)
+                printf("mkfifo error: %s \n", strerror(errno));
+            else
+            {
+                ctrlfd = open(ctrl_path, O_RDWR | O_NONBLOCK);
+                if (ctrlfd < 0)
+                    printf("open control fifo error: %s \n", strerror(errno));
+                else
+                    printf("Control FIFO ready at %s\n", ctrl_path);
+            }
+        }
+    }
 
     for (;;)
     {
@@ -559,6 +625,42 @@ usbip_run (const USB_DEVICE_DESCRIPTOR* dev_dsc)                                
 
         while(1)
         {
+            if (ctrlfd >= 0)
+            {
+                struct pollfd fds[2];
+                fds[0].fd = sockfd; fds[0].events = POLLIN; fds[0].revents = 0;
+                fds[1].fd = ctrlfd; fds[1].events = POLLIN; fds[1].revents = 0;
+                if (poll(fds, 2, -1) < 0)
+                {
+                    if (errno == EINTR)
+                        continue;
+                    printf("poll error: %s \n", strerror(errno));
+                    break;
+                }
+                if (fds[1].revents & POLLIN)
+                {
+                    int n = read(ctrlfd, ctrlbuf + ctrlbuf_len, sizeof(ctrlbuf) - ctrlbuf_len - 1);
+                    if (n > 0)
+                    {
+                        ctrlbuf_len += n;
+                        ctrlbuf[ctrlbuf_len] = 0;
+                        char* start = ctrlbuf;
+                        char* nl;
+                        while ((nl = strchr(start, '\n')))
+                        {
+                            *nl = 0;
+                            if (*start)
+                                ctrl_line_handler(sockfd, start);
+                            start = nl + 1;
+                        }
+                        int rem = ctrlbuf + ctrlbuf_len - start;
+                        memmove(ctrlbuf, start, rem);
+                        ctrlbuf_len = rem;
+                    }
+                }
+                if (!(fds[0].revents & (POLLIN | POLLHUP | POLLERR)))
+                    continue; // only the control fifo was ready; go back to polling
+            }
             if(! attached)
             {
                 OP_REQ_DEVLIST req;
